@@ -4,11 +4,12 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 
-token = "YOUR_TOKEN_HERE"
+token = "7014899022:AAEddAEJBNhGZsLNRqBu_JEOk1CtUp_OkTg"
 
 class User:
-    def __init__(self, user_id):
+    def __init__(self, user_id, username=None):
         self.user_id = user_id
+        self.username = username
         self.gold = 0
         self.exp = 0
         self.level = 1
@@ -39,9 +40,9 @@ class GameBot:
         self.users = {}
         self.worker_cost = 100
 
-    def get_user(self, user_id):
+    def get_user(self, user_id, username=None):
         if user_id not in self.users:
-            self.users[user_id] = User(user_id)
+            self.users[user_id] = User(user_id, username)
         return self.users[user_id]
 
     async def start(self):
@@ -54,8 +55,9 @@ class GameBot:
 
     async def update_resources_loop(self):
         while True:
-            for user in self.users.values():
+            for user_id, user in self.users.items():
                 user.update_resources()
+                await self.save_user(user)
             await asyncio.sleep(1)
 
     async def get_user_from_db(self, user_id):
@@ -66,15 +68,13 @@ class GameBot:
             host='192.168.1.24',
             port=5424
         )
-
-        user_data = await conn.fetchrow(f'''
-            SELECT * FROM Users WHERE user_id = {user_id}
-        ''')
-
+        user_data = await conn.fetchrow('''
+            SELECT * FROM Users WHERE user_id = $1
+        ''', user_id)
         await conn.close()
 
         if user_data:
-            user = User(user_id)
+            user = User(user_id, username=user_data.get('username'))
             user.gold = user_data['gold']
             user.exp = user_data['exp']
             user.level = user_data['level']
@@ -100,11 +100,12 @@ class GameBot:
             port=5424
         )
 
-        await conn.execute(f'''
-            INSERT INTO Users (user_id, gold, exp, level, workers, gold_per_sec, exp_per_sec, gold_workers, exp_workers, needed_exp, pickaxe_level, sword_level, pickaxe_cost, sword_cost)
-            VALUES ({user.user_id}, {user.gold}, {user.exp}, {user.level}, {user.workers}, {user.gold_per_sec}, {user.exp_per_sec}, {user.gold_workers}, {user.exp_workers}, {user.needed_exp}, {user.pickaxe_level}, {user.sword_level}, {user.pickaxe_cost}, {user.sword_cost})
+        query = f'''
+            INSERT INTO Users (user_id, username, gold, exp, level, workers, gold_per_sec, exp_per_sec, gold_workers, exp_workers, needed_exp, pickaxe_level, sword_level, pickaxe_cost, sword_cost)
+            VALUES ({user.user_id}, '{user.username}', {user.gold}, {user.exp}, {user.level}, {user.workers}, {user.gold_per_sec}, {user.exp_per_sec}, {user.gold_workers}, {user.exp_workers}, {user.needed_exp}, {user.pickaxe_level}, {user.sword_level}, {user.pickaxe_cost}, {user.sword_cost})
             ON CONFLICT (user_id) DO UPDATE
-            SET gold = EXCLUDED.gold,
+            SET username = EXCLUDED.username,
+                gold = EXCLUDED.gold,
                 exp = EXCLUDED.exp,
                 level = EXCLUDED.level,
                 workers = EXCLUDED.workers,
@@ -117,20 +118,22 @@ class GameBot:
                 sword_level = EXCLUDED.sword_level,
                 pickaxe_cost = EXCLUDED.pickaxe_cost,
                 sword_cost = EXCLUDED.sword_cost
-        ''')
+        '''
 
+        await conn.execute(query)
         await conn.close()
 
     async def start_command(self, message: types.Message):
         user_id = message.from_user.id
-        user = self.get_user(user_id)
+        username = message.from_user.username
+        user = self.get_user(user_id, username)
 
         if user.gold == 0 and user.exp == 0:
             db_user = await self.get_user_from_db(user_id)
             if db_user:
                 self.users[user_id] = db_user
             else:
-                user = User(user_id)
+                user = User(user_id, username)
                 self.users[user_id] = user
             await self.save_user(user)
 
@@ -157,6 +160,9 @@ class GameBot:
         user_id = callback_query.from_user.id
         user = self.get_user(user_id)
         action = callback_query.data
+
+        # Обрабатываем нажатие на кнопку и сразу подтверждаем получение запроса
+        await callback_query.answer()
 
         if action == "load_progress":
             db_user = await self.get_user_from_db(user_id)
@@ -197,7 +203,8 @@ class GameBot:
         else:
             leaderboard_text = "Топ 3 игрока:\n"
             for idx, player in enumerate(top_players):
-                leaderboard_text += f"{idx + 1}. Пользователь {player['user_id']} - Золото: {player['gold']} - Уровень: {player['level']}\n"
+                username = player.get('username', 'Неизвестный')  # Используем 'Неизвестный', если имя не задано
+                leaderboard_text += f"{idx + 1}. {username} (ID: {player['user_id']}) - Золото: {player['gold']} - Уровень: {player['level']}\n"
 
             await callback_query.message.answer(leaderboard_text)
 
@@ -211,61 +218,30 @@ class GameBot:
             await callback_query.message.answer(
                 f"1 рабочий отправлен на добычу золота.\nОсталось рабочих: {user.workers}")
 
+
     async def exp_click(self, callback_query, user):
         if user.workers <= 0:
             await callback_query.message.answer("У вас нет рабочих")
         else:
             user.workers -= 1
             user.exp_workers += 1
-            user.exp_per_sec += 20
+            user.exp_per_sec += 10
             await callback_query.message.answer(
-                f"1 рабочий отправлен на добычу опыта.\nОсталось рабочих: {user.workers}"
-            )
+                f"1 рабочий отправлен на добычу опыта.\nОсталось рабочих: {user.workers}")
 
     async def shop_menu(self, callback_query, user):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"Купить рабочего ({self.worker_cost} золота)", callback_data="buy_worker")],
-            [InlineKeyboard```python
-Button(text=f"Улучшить кирку ({user.pickaxe_cost} золота)", callback_data="upgrade_pickaxe")],
+            [InlineKeyboardButton(text=f"Нанять рабочего ({self.worker_cost} золота)", callback_data="buy_worker")],
+            [InlineKeyboardButton(text=f"Улучшить кирку ({user.pickaxe_cost} золота)", callback_data="upgrade_pickaxe")],
             [InlineKeyboardButton(text=f"Улучшить меч ({user.sword_cost} золота)", callback_data="upgrade_sword")],
-            [InlineKeyboardButton(text="Назад", callback_data="back_to_menu")]
         ])
-
         await callback_query.message.answer("Магазин 🛒", reply_markup=keyboard)
-
-    async def profile(self, callback_query, user):
-        profile_text = (
-            f"👤 Профиль пользователя:\n"
-            f"🆔 ID: {user.user_id}\n"
-            f"💰 Золото: {user.gold}\n"
-            f"✨ Опыт: {user.exp}/{user.needed_exp}\n"
-            f"⭐ Уровень: {user.level}\n"
-            f"🔨 Уровень кирки: {user.pickaxe_level}\n"
-            f"⚔️ Уровень меча: {user.sword_level}\n"
-            f"👷 Рабочие: {user.workers}\n"
-            f"💸 Золото в секунду: {user.gold_per_sec}\n"
-            f"📈 Опыт в секунду: {user.exp_per_sec}\n"
-        )
-        await callback_query.message.answer(profile_text)
-
-    async def statistics(self, callback_query, user):
-        statistics_text = (
-            f"📊 Статистика:\n"
-            f"💰 Добыто золота: {user.gold}\n"
-            f"✨ Добыто опыта: {user.exp}\n"
-            f"⭐ Уровень: {user.level}\n"
-            f"👷 Рабочие: {user.workers}\n"
-            f"💸 Золото в секунду: {user.gold_per_sec}\n"
-            f"📈 Опыт в секунду: {user.exp_per_sec}\n"
-        )
-        await callback_query.message.answer(statistics_text)
 
     async def buy_worker(self, callback_query, user):
         if user.gold >= self.worker_cost:
             user.gold -= self.worker_cost
             user.workers += 1
-            await callback_query.message.answer(
-                f"Вы наняли рабочего! Осталось рабочих: {user.workers}")
+            await callback_query.message.answer(f"Вы наняли рабочего. Всего рабочих: {user.workers}")
         else:
             await callback_query.message.answer("Недостаточно золота для найма рабочего.")
 
@@ -273,10 +249,9 @@ Button(text=f"Улучшить кирку ({user.pickaxe_cost} золота)", c
         if user.gold >= user.pickaxe_cost:
             user.gold -= user.pickaxe_cost
             user.pickaxe_level += 1
-            user.gold_per_sec += 10  # Пример, может быть любая другая логика
-            user.pickaxe_cost *= 2  # Увеличиваем стоимость следующего улучшения
-            await callback_query.message.answer(
-                f"Вы улучшили кирку до уровня {user.pickaxe_level}!")
+            user.pickaxe_cost *= 2
+            user.gold_per_sec += 5
+            await callback_query.message.answer(f"Кирка улучшена до уровня {user.pickaxe_level}.")
         else:
             await callback_query.message.answer("Недостаточно золота для улучшения кирки.")
 
@@ -284,12 +259,37 @@ Button(text=f"Улучшить кирку ({user.pickaxe_cost} золота)", c
         if user.gold >= user.sword_cost:
             user.gold -= user.sword_cost
             user.sword_level += 1
-            user.exp_per_sec += 10  # Пример, может быть любая другая логика
-            user.sword_cost *= 2  # Увеличиваем стоимость следующего улучшения
-            await callback_query.message.answer(
-                f"Вы улучшили меч до уровня {user.sword_level}!")
+            user.sword_cost *= 2
+            user.exp_per_sec += 5
+            await callback_query.message.answer(f"Меч улучшен до уровня {user.sword_level}.")
         else:
             await callback_query.message.answer("Недостаточно золота для улучшения меча.")
+
+    async def profile(self, callback_query, user):
+        profile_text = (
+            f"Профиль игрока:\n"
+            f"Имя: {user.username}\n"  # Добавляем имя пользователя
+            f"Уровень: {user.level}\n"
+            f"Опыт: {user.exp}/{user.needed_exp}\n"  # Отображение текущего опыта и необходимого для следующего уровня
+            f"Золото: {user.gold}\n"
+            f"Рабочие: {user.workers}\n"
+            f"Добыча золота в секунду: {user.gold_per_sec}\n"
+            f"Добыча опыта в секунду: {user.exp_per_sec}"
+        )
+        await callback_query.message.answer(profile_text)
+
+    async def statistics(self, callback_query, user):
+        statistics_text = (
+            f"Статистика:\n"
+            f"Имя: {user.username}\n"  # Добавляем имя пользователя
+            f"Уровень: {user.level}\n"
+            f"Золото: {user.gold}\n"
+            f"Опыт: {user.exp}\n"
+            f"Рабочие: {user.workers}\n"
+            f"Золото в секунду: {user.gold_per_sec}\n"
+            f"Опыт в секунду: {user.exp_per_sec}"
+        )
+        await callback_query.message.answer(statistics_text)
 
     async def get_top_players(self):
         conn = await asyncpg.connect(
@@ -299,16 +299,25 @@ Button(text=f"Улучшить кирку ({user.pickaxe_cost} золота)", c
             host='192.168.1.24',
             port=5424
         )
-
-        top_players = await conn.fetch('''
-            SELECT user_id, gold, level FROM Users
-            ORDER BY gold DESC
-            LIMIT 3
+        players = await conn.fetch('''
+            SELECT user_id, username, gold, level FROM Users ORDER BY gold DESC LIMIT 3
         ''')
-
         await conn.close()
-        return top_players
+        return players
+
+    async def leaderboard(self, callback_query: types.CallbackQuery):
+        top_players = await self.get_top_players()
+
+        if not top_players:
+            await callback_query.message.answer("Нет данных для отображения.")
+        else:
+            leaderboard_text = "Топ 3 игрока:\n"
+            for idx, player in enumerate(top_players):
+                username = player.get('username', 'Неизвестный')  # Используем 'Неизвестный', если имя не задано
+                leaderboard_text += f"{idx + 1}. {username} (ID: {player['user_id']}) - Золото: {player['gold']} - Уровень: {player['level']}\n"
+
+            await callback_query.message.answer(leaderboard_text)
 
 if __name__ == "__main__":
-    game_bot = GameBot(token)
-    asyncio.run(game_bot.start())
+    bot = GameBot(token)
+    asyncio.run(bot.start())
